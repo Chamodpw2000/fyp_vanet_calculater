@@ -19,13 +19,13 @@ BIN_DIR         = os.path.join(FABRIC_BASE, "bin")
 CFG_DIR         = os.path.join(FABRIC_BASE, "config")
 
 ORG1_BASE       = os.path.join(TEST_NETWORK,
-                  "organizations/peerOrganizations/org1.example.com")
+                  "organizations/peerOrganizations/controllers.example.com")
 
 TLS_CERT_ORG1   = os.path.join(ORG1_BASE,
-                  "peers/peer0.org1.example.com/tls/ca.crt")
+                  "peers/controller0.controllers.example.com/tls/ca.crt")
 
 MSP_PATH_ORG1   = os.path.join(ORG1_BASE,
-                  "users/Admin@org1.example.com/msp")
+                  "users/Admin@controllers.example.com/msp")
 
 TLS_CERT_ORG2   = os.path.join(TEST_NETWORK,
                   "organizations/peerOrganizations/org2.example.com"

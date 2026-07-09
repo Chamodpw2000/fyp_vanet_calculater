@@ -2,7 +2,7 @@
 """
 VANET Aggregator
 Watches /tmp/ for vanet_raw_ready_N sentinel files.
-Verifies all 100 per-node CSV files are present, then logs ready.
+Verifies all 321 per-node CSV files are present, then logs ready.
 """
 
 import os
@@ -23,7 +23,7 @@ from watchdog.events import FileSystemEventHandler
 
 WATCH_DIR   = "/tmp"
 LOG_FILE    = "/tmp/vanet_aggregator.log"
-TOTAL_NODES = 100
+TOTAL_NODES = 321
 WAIT_TIMEOUT = 0.5
 AGGREGATED_DIR   = os.path.expanduser("~/vanet_calculater/aggregated_data")
 
@@ -124,8 +124,8 @@ def verify_cycle(cycle_id: int) -> dict:
         "cid_planned_inbound": cid_planned_inbound,
         "stored_hash": stored_hash,
         "computed_hash": computed_hash,
-        "flow_rules": combined["flow_rules",[]],
-        "planned_inbound": combined["planned_inbound",[]],
+        "flow_rules": combined.get("flow_rules", []),
+        "planned_inbound": combined.get("planned_inbound", []),
         "verified": verified
     }
 
@@ -242,6 +242,40 @@ def save_verified_flow_rules_csv(cycle_id: int, flow_rules: list) -> str:
                 f"→ {output_path}")
 
     return output_path
+
+def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> str:
+    """
+    Writes the verified planned inbound entries (fetched from IPFS,
+    hash-checked against Fabric) into a CSV file for this cycle.
+
+    TODO: confirm actual field names written by fix.cc for
+    planned_inbound entries — placeholders below.
+    """
+    os.makedirs(AGGREGATED_DIR, exist_ok=True)
+
+    output_path = os.path.join(
+        AGGREGATED_DIR, f"verified_planned_inbound_cycle_{cycle_id}.csv")
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "cycle", "timestamp", "node_id", "flow_id", "expected_rate"
+        ])
+
+        for entry in planned_inbound:
+            writer.writerow([
+                entry.get("cycle"),
+                entry.get("timestamp"),
+                entry.get("node_id"),
+                entry.get("flow_id"),
+                entry.get("expected_rate"),
+            ])
+
+    logger.info(f"[AGGREGATOR] Cycle {cycle_id} | "
+                f"verified planned inbound saved ({len(planned_inbound)} rows) "
+                f"→ {output_path}")
+
+    return output_path
 def process_cycle(cycle_id: int):
 
     logger.info(f"{'='*55}")
@@ -294,6 +328,7 @@ def process_cycle(cycle_id: int):
 
         # ── Step 4: Aggregate all per-node CSVs into one file ───────────────
         aggregated_path = aggregate_node_csvs(cycle_id, present)
+        save_verified_planned_inbound_csv(cycle_id, result["planned_inbound"])
 
         # ── Step 5: Cleanup per-node CSVs + sentinel ─────────────────────────
         if aggregated_path:
