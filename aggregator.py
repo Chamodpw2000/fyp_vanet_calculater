@@ -248,8 +248,8 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
     Writes the verified planned inbound entries (fetched from IPFS,
     hash-checked against Fabric) into a CSV file for this cycle.
 
-    TODO: confirm actual field names written by fix.cc for
-    planned_inbound entries — placeholders below.
+    Same fields as written by fix.cc's write_planned_inbound_json_for_middleware():
+        cycle, flow_id, node, planned_inbound_by_subflow, planned_inbound_by_mainflow
     """
     os.makedirs(AGGREGATED_DIR, exist_ok=True)
 
@@ -259,21 +259,24 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "cycle", "timestamp", "node_id", "flow_id", "expected_rate"
+            "cycle", "flow_id", "node",
+            "planned_inbound_by_subflow", "planned_inbound_by_mainflow"
         ])
 
         for entry in planned_inbound:
             writer.writerow([
                 entry.get("cycle"),
-                entry.get("timestamp"),
-                entry.get("node_id"),
                 entry.get("flow_id"),
-                entry.get("expected_rate"),
+                entry.get("node"),
+                entry.get("planned_inbound_by_subflow"),
+                entry.get("planned_inbound_by_mainflow"),
             ])
 
     logger.info(f"[AGGREGATOR] Cycle {cycle_id} | "
                 f"verified planned inbound saved ({len(planned_inbound)} rows) "
                 f"→ {output_path}")
+
+    return output_path
 
     return output_path
 def process_cycle(cycle_id: int):
