@@ -18,7 +18,7 @@ def _get_fabric_env() -> dict:
         "PATH":                        f"{BIN_DIR}:{env.get('PATH', '')}",
         "FABRIC_CFG_PATH":             CFG_DIR,
         "CORE_PEER_TLS_ENABLED":       "true",
-        "CORE_PEER_LOCALMSPID":        "Org1MSP",
+        "CORE_PEER_LOCALMSPID":        "ControllersMSP",
         "CORE_PEER_ADDRESS":           PEER_ORG1,
         "CORE_PEER_TLS_ROOTCERT_FILE": TLS_CERT_ORG1,
         "CORE_PEER_MSPCONFIGPATH":     MSP_PATH_ORG1,
