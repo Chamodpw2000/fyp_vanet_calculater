@@ -588,6 +588,24 @@ def run_ff_analysis(cycle_id: int,
     return stats
 
 
+
+# ============================================================
+#  ATTACK-DETECTION SENTINEL
+#  Signals detector.py that ff_node_anomaly_scores_N.csv is
+#  fully written and ready to be read.
+# ============================================================
+def write_attack_sentinel(cycle_id: int) -> str:
+    sentinel_path = os.path.join(
+        AGGREGATED_DIR, f"vanet_attack_ready_{cycle_id}"
+    )
+    with open(sentinel_path, "w") as f:
+        pass
+    logger.info(
+        f"[AGGREGATOR] Cycle {cycle_id} | "
+        f"attack-detection sentinel written → {sentinel_path}"
+    )
+    return sentinel_path
+
 # ============================================================
 #  PROCESS CYCLE  (main per-cycle orchestrator)
 # ============================================================
@@ -676,6 +694,7 @@ def process_cycle(cycle_id: int):
         result["planned_inbound"],   # list of dicts — direct from IPFS
     )
 
+    write_attack_sentinel(cycle_id)
 
 # ============================================================
 #  WATCHDOG EVENT HANDLER
