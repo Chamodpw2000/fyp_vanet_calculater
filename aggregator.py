@@ -489,10 +489,13 @@ def compute_cycle(data: dict, writers: dict) -> dict:
             score_w.writerow([
                 cycle, sim_time, fid, flow_src, flow_dst,
                 r["node_id"], r["ntype"], r["n_next_hops"],
-                f"{r['sum_abs_dev']:.4f}", f"{FF_DEV_THRESHOLD:.4f}",
+                f"{r['sum_abs_dev']:.4f}", 
+                f"{r['sum_abs_dev'] / r['n_next_hops']:.4f}",
+                f"{FF_DEV_THRESHOLD:.4f}",
                 r["detected"], r["unique_inbound"], r["total_outbound"],
                 f"{r['node_pdr']:.2f}", f"{mean_pdr_flow:.2f}",
                 f"{pdr_deviation:.2f}", f"{inbound_ratio:.4f}",
+                
             ])
 
     return {
@@ -551,6 +554,7 @@ def run_ff_analysis(cycle_id: int,
             "cycle_id", "sim_time_s", "flow_id", "flow_source",
             "flow_destination", "node_id", "node_type",
             "num_active_next_hops", "sum_abs_ff_deviation",
+            "sum_abs_ff_deviation_normalized",
             "threshold", "detected", "total_inbound",
             "total_outbound", "node_pdr", "mean_pdr_flow",
             "pdr_deviation", "inbound_ratio",
