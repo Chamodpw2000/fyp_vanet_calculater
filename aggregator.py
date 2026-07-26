@@ -41,6 +41,7 @@ from watchdog.events import FileSystemEventHandler
 WATCH_DIR      = "/tmp"
 LOG_FILE       = "/tmp/vanet_aggregator.log"
 AGGREGATED_DIR = "/tmp/ai_agent"          # ALL output files go here
+DRL_DIR        = "/tmp/drl_agent"         # mirror copy for DRL agent
 
 # ─────────────────────────────────────────────
 #  Constants  (mirrored from fix.cc)
@@ -187,6 +188,14 @@ def aggregate_node_csvs(cycle_id: int, present_nodes: list):
         f"aggregated {len(all_rows)} rows from {len(present_nodes)} nodes "
         f"→ {output_path}"
     )
+
+    # ── Mirror copy to DRL_DIR ────────────────────────────────────────────
+    import shutil
+    os.makedirs(DRL_DIR, exist_ok=True)
+    drl_path = os.path.join(DRL_DIR, f"aggregated_cycle_{cycle_id}.csv")
+    shutil.copy2(output_path, drl_path)
+    logger.info(f"[AGGREGATOR] Cycle {cycle_id} | DRL mirror → {drl_path}")
+
     return output_path, header, all_rows
 
 
@@ -246,6 +255,29 @@ def save_verified_flow_rules_csv(cycle_id: int, flow_rules: list) -> str:
         f"[AGGREGATOR] Cycle {cycle_id} | "
         f"verified flow rules saved ({len(flow_rules)} rows) → {output_path}"
     )
+
+    # ── Mirror copy to DRL_DIR ────────────────────────────────────────────
+    os.makedirs(DRL_DIR, exist_ok=True)
+    drl_path = os.path.join(DRL_DIR, f"verified_flow_rules_cycle_{cycle_id}.csv")
+    with open(drl_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "cycle", "timestamp", "flow_id", "src", "dst",
+            "from_node", "to_node", "delta_value",
+        ])
+        for rule in flow_rules:
+            writer.writerow([
+                rule.get("cycle"),
+                rule.get("timestamp"),
+                rule.get("flow_id"),
+                rule.get("src"),
+                rule.get("dst"),
+                rule.get("from_node"),
+                rule.get("to_node"),
+                rule.get("delta_value"),
+            ])
+    logger.info(f"[AGGREGATOR] Cycle {cycle_id} | DRL mirror → {drl_path}")
+
     return output_path
 
 
@@ -272,6 +304,26 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
         f"[AGGREGATOR] Cycle {cycle_id} | "
         f"verified planned inbound saved ({len(planned_inbound)} rows) → {output_path}"
     )
+
+    # ── Mirror copy to DRL_DIR ────────────────────────────────────────────
+    os.makedirs(DRL_DIR, exist_ok=True)
+    drl_path = os.path.join(DRL_DIR, f"verified_planned_inbound_cycle_{cycle_id}.csv")
+    with open(drl_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "cycle", "flow_id", "node",
+            "planned_inbound_by_subflow", "planned_inbound_by_mainflow",
+        ])
+        for entry in planned_inbound:
+            writer.writerow([
+                entry.get("cycle"),
+                entry.get("flow_id"),
+                entry.get("node"),
+                entry.get("planned_inbound_by_subflow"),
+                entry.get("planned_inbound_by_mainflow"),
+            ])
+    logger.info(f"[AGGREGATOR] Cycle {cycle_id} | DRL mirror → {drl_path}")
+
     return output_path
 
 
@@ -385,12 +437,18 @@ def compute_cycle(data: dict, writers: dict) -> dict:
     no_cov         = 0
     detected_total = 0
 
-    for fid in sorted(outbound.keys()):
+    all_flow_ids = set(inbound.keys()) | set(outbound.keys())
+
+    for fid in sorted(all_flow_ids):
+
         flow_src, flow_dst = flow_meta.get(fid, (-1, -1))
         flow_node_records  = []
-
-        for node_id in sorted(outbound[fid].keys()):
-            nexthop_map = outbound[fid][node_id]
+        flow_node_ids = (
+            set(inbound.get(fid, {}).keys())
+            | set(outbound.get(fid, {}).keys())
+        )
+        for node_id in sorted(flow_node_ids):
+            nexthop_map = outbound.get(fid, {}).get(node_id, {})
 
             if node_id == flow_src or node_id == flow_dst:
                 role = "SOURCE" if node_id == flow_src else "DESTINATION"
@@ -410,6 +468,11 @@ def compute_cycle(data: dict, writers: dict) -> dict:
             total_outbound_from_node = sum(
                 len(pset) for pset in nexthop_map.values()
             )
+
+            received_but_not_forwarded = (
+            unique_inbound > 0 and total_outbound_from_node == 0
+            )
+
 
             pool_w.writerow([
                 cycle, sim_time, fid, flow_src, flow_dst,
@@ -450,25 +513,39 @@ def compute_cycle(data: dict, writers: dict) -> dict:
                     f"{observed_ff:.4f}", f"{expected_delta:.4f}",
                     f"{deviation:.4f}",
                 ])
-
-            if node_num_next_hops > 0:
-                detected = 1 if node_sum_abs_dev > FF_DEV_THRESHOLD else 0
-                detected_total += detected
-                node_pdr = (
-                    (total_outbound_from_node / unique_inbound) * 100.0
-                    if unique_inbound > 0 else 0.0
+            # A node that received packets but forwarded none has a complete
+            # forwarding failure, so assign the maximum deviation value.
+            if received_but_not_forwarded:
+                node_sum_abs_dev = 1.0
+            # Score every intermediate node that received at least one packet,
+            # even when it never appeared as a previous_sender_id.
+            # Only score if planned inbound is known and > 0.
+            pi_subflow = planned_inbound.get((fid, node_id), 0)
+            if unique_inbound > 0 and pi_subflow > 0:
+                detected = (
+                    1
+                    if node_num_next_hops > 0
+                    and node_sum_abs_dev > FF_DEV_THRESHOLD
+                    else 0
                 )
-                pi_subflow = planned_inbound.get((fid, node_id), 0)
+                detected_total += detected
+
+                node_pdr = (
+                    total_outbound_from_node / unique_inbound
+                ) * 100.0
+
+               
+
                 flow_node_records.append({
-                    "node_id":       node_id,
-                    "ntype":         ntype,
-                    "n_next_hops":   node_num_next_hops,
-                    "sum_abs_dev":   node_sum_abs_dev,
-                    "detected":      detected,
-                    "unique_inbound":unique_inbound,
-                    "total_outbound":total_outbound_from_node,
-                    "node_pdr":      node_pdr,
-                    "pi_subflow":    pi_subflow,
+                    "node_id":        node_id,
+                    "ntype":          ntype,
+                    "n_next_hops":    node_num_next_hops,
+                    "sum_abs_dev":    node_sum_abs_dev,
+                    "detected":       detected,
+                    "unique_inbound": unique_inbound,
+                    "total_outbound": total_outbound_from_node,
+                    "node_pdr":       node_pdr,
+                    "pi_subflow":     pi_subflow,
                 })
 
         # ── Pass 2: mean PDR across this flow's scored nodes ─────────────
@@ -481,22 +558,30 @@ def compute_cycle(data: dict, writers: dict) -> dict:
             mean_pdr_flow = 0.0
 
         for r in flow_node_records:
-            pdr_deviation  = mean_pdr_flow - r["node_pdr"]
-            inbound_ratio  = (
+            pdr_deviation = mean_pdr_flow - r["node_pdr"]
+
+            normalized_abs_dev = (
+                r["sum_abs_dev"] / r["n_next_hops"]
+                if r["n_next_hops"] > 0 
+                else 1.0
+            )
+
+            inbound_ratio = (
                 r["pi_subflow"] / r["unique_inbound"]
                 if r["unique_inbound"] > 0 else 0.0
             )
+
             score_w.writerow([
                 cycle, sim_time, fid, flow_src, flow_dst,
                 r["node_id"], r["ntype"], r["n_next_hops"],
-                f"{r['sum_abs_dev']:.4f}", 
-                f"{r['sum_abs_dev'] / r['n_next_hops']:.4f}",
-                f"{FF_DEV_THRESHOLD:.4f}",
-                r["detected"], r["unique_inbound"], r["total_outbound"],
-                f"{r['node_pdr']:.2f}", f"{mean_pdr_flow:.2f}",
-                f"{pdr_deviation:.2f}", f"{inbound_ratio:.4f}",
-                
-            ])
+                f"{r['sum_abs_dev']:.4f}",
+                f"{normalized_abs_dev:.4f}",
+                        f"{FF_DEV_THRESHOLD:.4f}",
+                        r["detected"], r["unique_inbound"], r["total_outbound"],
+                        f"{r['node_pdr']:.2f}", f"{mean_pdr_flow:.2f}",
+                        f"{pdr_deviation:.2f}", f"{inbound_ratio:.4f}",
+                        
+                    ])
 
     return {
         "total_computed": total_computed,
@@ -572,6 +657,14 @@ def run_ff_analysis(cycle_id: int,
         # ── Stage 2 : run FF / deviation / PDR / anomaly math ─────────
         stats = compute_cycle(data, writers)
 
+    # ── Mirror the three FF CSVs to DRL_DIR ──────────────────────────────
+    import shutil
+    os.makedirs(DRL_DIR, exist_ok=True)
+    for src_path in [pool_path, ff_path, score_path]:
+        dst_path = os.path.join(DRL_DIR, os.path.basename(src_path))
+        shutil.copy2(src_path, dst_path)
+        logger.info(f"[FF-ANALYSIS] Cycle {cycle_id} | DRL mirror → {dst_path}")
+
     logger.info(
         f"[FF-ANALYSIS] Cycle {cycle_id} | t={data['sim_time']}s | "
         f"FF computed={stats['total_computed']} | "
@@ -607,9 +700,22 @@ def write_attack_sentinel(cycle_id: int) -> str:
     return sentinel_path
 
 # ============================================================
-#  PROCESS CYCLE  (main per-cycle orchestrator)
+#  DRL-AGENT SENTINEL
+#  Signals the DRL agent that all mirrored files for cycle N
+#  are fully written and ready to be read.
 # ============================================================
-def process_cycle(cycle_id: int):
+def write_drl_sentinel(cycle_id: int) -> str:
+    os.makedirs(DRL_DIR, exist_ok=True)
+    sentinel_path = os.path.join(
+        DRL_DIR, f"drl_cycle_{cycle_id}_ready_mid"
+    )
+    with open(sentinel_path, "w") as f:
+        pass
+    logger.info(
+        f"[AGGREGATOR] Cycle {cycle_id} | "
+        f"DRL sentinel written → {sentinel_path}"
+    )
+    return sentinel_path
     logger.info("=" * 55)
     logger.info(f"[AGGREGATOR] Sentinel detected — cycle {cycle_id}")
 
@@ -695,6 +801,7 @@ def process_cycle(cycle_id: int):
     )
 
     write_attack_sentinel(cycle_id)
+    write_drl_sentinel(cycle_id)
 
 # ============================================================
 #  WATCHDOG EVENT HANDLER
