@@ -716,6 +716,12 @@ def write_drl_sentinel(cycle_id: int) -> str:
         f"DRL sentinel written → {sentinel_path}"
     )
     return sentinel_path
+
+
+# ============================================================
+#  PROCESS CYCLE  (main per-cycle orchestrator)
+# ============================================================
+def process_cycle(cycle_id: int):
     logger.info("=" * 55)
     logger.info(f"[AGGREGATOR] Sentinel detected — cycle {cycle_id}")
 
