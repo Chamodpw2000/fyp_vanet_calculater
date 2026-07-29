@@ -42,6 +42,7 @@ WATCH_DIR      = "/tmp"
 LOG_FILE       = "/tmp/vanet_aggregator.log"
 AGGREGATED_DIR = "/tmp/ai_agent"          # ALL output files go here
 DRL_DIR        = "/tmp/drl_agent"         # mirror copy for DRL agent
+MIN_HOP_DIR    = "/tmp"                    # where NS-3 writes min_hops_next_hop_N.csv
 
 # ─────────────────────────────────────────────
 #  Constants  (mirrored from fix.cc)
@@ -328,6 +329,44 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
 
 
 # ============================================================
+#  LOAD SHORTEST-NEXT-HOP DATA  (from NS-3 min_hops_next_hop_N.csv)
+#  Builds a lookup:  (flow_id, node_id) -> set of shortest next-hop ids
+#  Rows with next_hop_node == 999 mean "all next hops equal / single
+#  option" — indistinguishable, so those nodes are marked (via a
+#  separate set) as NOT stretch-testable.
+# ============================================================
+def load_shortest_next_hops(cycle_id: int):
+    path = os.path.join(MIN_HOP_DIR, f"min_hops_next_hop_{cycle_id}.csv")
+
+    shortest = defaultdict(set)   # (fid, node) -> {shortest next hop ids}
+    indistinct = set()            # (fid, node) with a 999 row (not testable)
+
+    if not os.path.exists(path):
+        logger.warning(
+            f"[MIN-HOP] Cycle {cycle_id} | file not found: {path} "
+            f"(is_stretched will be blank)"
+        )
+        return shortest, indistinct
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fid  = int(row["flow_id"])
+            node = int(row["node_id"])
+            nh   = int(row["next_hop_node"])
+            if nh == 999:
+                indistinct.add((fid, node))
+            else:
+                shortest[(fid, node)].add(nh)
+
+    logger.info(
+        f"[MIN-HOP] Cycle {cycle_id} | loaded shortest next hops for "
+        f"{len(shortest)} (flow,node) keys, {len(indistinct)} indistinct"
+    )
+    return shortest, indistinct
+
+
+# ============================================================
 #  STAGE 1 — load_cycle()
 #  Builds in-memory structures from data already in memory.
 #  No file I/O here — everything is passed in directly.
@@ -355,6 +394,12 @@ def load_cycle(overhear_rows, overhear_header,
     all_watchers= set()
     sim_time    = None
 
+    # Per-quarter packet sets, keyed by (fid, node) -> [q0,q1,q2,q3] of pid-sets.
+    # Quarter is decided by the fractional part of previous_tx_timestamp_s:
+    #   [0,0.25)->0  [0.25,0.5)->1  [0.5,0.75)->2  [0.75,1.0)->3
+    inbound_q  = defaultdict(lambda: [set(), set(), set(), set()])
+    outbound_q = defaultdict(lambda: [set(), set(), set(), set()])
+
     for row in overhear_rows:
         fid  = int(row[col["flow_id"]])
         wid  = int(row[col["watcher_node_id"]])
@@ -367,6 +412,19 @@ def load_cycle(overhear_rows, overhear_header,
         outbound[fid][sndr][rcvr].add(pid)
         watchers_out[fid][sndr].add(wid)
         all_watchers.add(wid)
+
+        # ── quarter-second bin from the node's own tx timestamp ──────────
+        try:
+            tx_t = float(row[col["previous_tx_timestamp_s"]])
+            q = int((tx_t % 1.0) / 0.25)
+            if q > 3:
+                q = 3                      # guard against tx_t exactly on 1.0
+        except (KeyError, ValueError):
+            q = 0                          # fallback if timestamp missing/bad
+
+        # inbound quarter for the receiver; outbound quarter for the sender
+        inbound_q[(fid, rcvr)][q].add(pid)
+        outbound_q[(fid, sndr)][q].add(pid)
 
         st = float(row[col["sim_time_s"]])
         if sim_time is None or st > sim_time:
@@ -409,6 +467,8 @@ def load_cycle(overhear_rows, overhear_header,
         "planned":         planned,
         "flow_meta":       flow_meta,
         "planned_inbound": planned_inbound,
+        "inbound_q":       inbound_q,
+        "outbound_q":      outbound_q,
     }
 
 
@@ -418,7 +478,8 @@ def load_cycle(overhear_rows, overhear_header,
 #  Zero changes to the calculation logic.
 #  `writers` is a dict of three csv.writer objects (headers already written).
 # ============================================================
-def compute_cycle(data: dict, writers: dict) -> dict:
+def compute_cycle(data: dict, writers: dict,
+                  shortest_next_hops: dict, indistinct_nodes: set) -> dict:
     cycle    = data["cycle_id"]
     sim_time = data["sim_time"]
     inbound  = data["inbound"]
@@ -428,6 +489,8 @@ def compute_cycle(data: dict, writers: dict) -> dict:
     planned      = data["planned"]
     flow_meta    = data["flow_meta"]
     planned_inbound = data["planned_inbound"]
+    inbound_q    = data["inbound_q"]
+    outbound_q   = data["outbound_q"]
 
     pool_w  = writers["pool"]
     ff_w    = writers["ff"]
@@ -534,7 +597,38 @@ def compute_cycle(data: dict, writers: dict) -> dict:
                     total_outbound_from_node / unique_inbound
                 ) * 100.0
 
-               
+                # ── FLOW-STRETCH CHECK ────────────────────────────────────
+                # Did this node forward ANY packet to one of its shortest
+                # next hops? If it sent nothing to the shortest path(s),
+                # it is stretching. 999 rows are indistinguishable → blank.
+                key = (fid, node_id)
+                if key in indistinct_nodes:
+                    is_stretched = ""          # not testable (all hops equal)
+                elif key in shortest_next_hops:
+                    shortest_set   = shortest_next_hops[key]
+                    forwarded_to   = set(nexthop_map.keys())   # who node sent to
+                    sent_to_short  = forwarded_to & shortest_set
+                    is_stretched   = len(sent_to_short) == 0   # True = stretched
+                else:
+                    is_stretched = ""          # no min-hop info for this node
+
+                # ── PER-QUARTER PDR VARIANCE ──────────────────────────────
+                # Split the second into 4 parts (0.25 each). For each part:
+                #   pdr_q = outbound_q / inbound_q * 100
+                # If no packets arrived in that part, pdr_q = 100 (not malicious).
+                in_q  = inbound_q.get((fid, node_id),  [set(), set(), set(), set()])
+                out_q = outbound_q.get((fid, node_id), [set(), set(), set(), set()])
+                pdr_quarters = []
+                for qi in range(4):
+                    n_in  = len(in_q[qi])
+                    n_out = len(out_q[qi])
+                    if n_in == 0:
+                        pdr_quarters.append(100.0)     # no inbound → treat as healthy
+                    else:
+                        pdr_quarters.append((n_out / n_in) * 100.0)
+
+                mean_q = sum(pdr_quarters) / 4.0
+                pdr_var = sum((p - mean_q) ** 2 for p in pdr_quarters) / 4.0
 
                 flow_node_records.append({
                     "node_id":        node_id,
@@ -546,6 +640,8 @@ def compute_cycle(data: dict, writers: dict) -> dict:
                     "total_outbound": total_outbound_from_node,
                     "node_pdr":       node_pdr,
                     "pi_subflow":     pi_subflow,
+                    "is_stretched":   is_stretched,
+                    "pdr_var":        pdr_var,
                 })
 
         # ── Pass 2: mean PDR across this flow's scored nodes ─────────────
@@ -580,7 +676,7 @@ def compute_cycle(data: dict, writers: dict) -> dict:
                         r["detected"], r["unique_inbound"], r["total_outbound"],
                         f"{r['node_pdr']:.2f}", f"{mean_pdr_flow:.2f}",
                         f"{pdr_deviation:.2f}", f"{inbound_ratio:.4f}",
-                        
+                        r["is_stretched"], f"{r['pdr_var']:.4f}",
                     ])
 
     return {
@@ -642,7 +738,7 @@ def run_ff_analysis(cycle_id: int,
             "sum_abs_ff_deviation_normalized",
             "threshold", "detected", "total_inbound",
             "total_outbound", "node_pdr", "mean_pdr_flow",
-            "pdr_deviation", "inbound_ratio",
+            "pdr_deviation", "inbound_ratio", "is_stretched", "pdr_var",
         ])
 
         writers = {"pool": pool_w, "ff": ff_w, "score": score_w}
@@ -654,8 +750,11 @@ def run_ff_analysis(cycle_id: int,
             cycle_id,
         )
 
+        # ── Stage 1b : load shortest next hops from NS-3 min-hop file ──
+        shortest_next_hops, indistinct_nodes = load_shortest_next_hops(cycle_id)
+
         # ── Stage 2 : run FF / deviation / PDR / anomaly math ─────────
-        stats = compute_cycle(data, writers)
+        stats = compute_cycle(data, writers, shortest_next_hops, indistinct_nodes)
 
     # ── Mirror the three FF CSVs to DRL_DIR ──────────────────────────────
     import shutil
