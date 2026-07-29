@@ -394,11 +394,25 @@ def load_cycle(overhear_rows, overhear_header,
     all_watchers= set()
     sim_time    = None
 
-    # Per-quarter packet sets, keyed by (fid, node) -> [q0,q1,q2,q3] of pid-sets.
-    # Quarter is decided by the fractional part of previous_tx_timestamp_s:
-    #   [0,0.25)->0  [0.25,0.5)->1  [0.5,0.75)->2  [0.75,1.0)->3
+    # ── Per-quarter binning (Fix A) ──────────────────────────────────────
+    # A packet is binned by the quarter in which the NODE RECEIVED it
+    # (the previous_tx_timestamp_s on the row where the node is the
+    # intended_receiver — i.e. its upstream's tx time = arrival proxy).
+    # Both inbound AND its forwarded copy are counted in that SAME quarter,
+    # so a node that forwards everything shows 100% in every quarter → var 0.
+    #
+    # arrival_q[(fid, node)][pid] = quarter the node received pid
+    arrival_q  = defaultdict(dict)
     inbound_q  = defaultdict(lambda: [set(), set(), set(), set()])
     outbound_q = defaultdict(lambda: [set(), set(), set(), set()])
+
+    def _quarter(tx_str):
+        try:
+            tx_t = float(tx_str)
+            q = int((tx_t % 1.0) / 0.25)
+            return 3 if q > 3 else q
+        except (KeyError, ValueError):
+            return 0
 
     for row in overhear_rows:
         fid  = int(row[col["flow_id"]])
@@ -413,22 +427,30 @@ def load_cycle(overhear_rows, overhear_header,
         watchers_out[fid][sndr].add(wid)
         all_watchers.add(wid)
 
-        # ── quarter-second bin from the node's own tx timestamp ──────────
-        try:
-            tx_t = float(row[col["previous_tx_timestamp_s"]])
-            q = int((tx_t % 1.0) / 0.25)
-            if q > 3:
-                q = 3                      # guard against tx_t exactly on 1.0
-        except (KeyError, ValueError):
-            q = 0                          # fallback if timestamp missing/bad
-
-        # inbound quarter for the receiver; outbound quarter for the sender
-        inbound_q[(fid, rcvr)][q].add(pid)
-        outbound_q[(fid, sndr)][q].add(pid)
+        # This row means: sndr transmitted pid, rcvr is meant to receive it.
+        # So pid ARRIVES at rcvr at this row's previous_tx_timestamp_s.
+        q_arrival = _quarter(row[col["previous_tx_timestamp_s"]])
+        arrival_q[(fid, rcvr)][pid] = q_arrival
+        inbound_q[(fid, rcvr)][q_arrival].add(pid)
 
         st = float(row[col["sim_time_s"]])
         if sim_time is None or st > sim_time:
             sim_time = st
+
+    # Second pass: bin each forwarded packet by the quarter its sender
+    # RECEIVED it (look up arrival_q for that sender). Packets a node
+    # forwards but was never seen receiving fall back to their own tx-quarter.
+    for row in overhear_rows:
+        fid  = int(row[col["flow_id"]])
+        pid  = int(row[col["packet_id"]])
+        sndr = int(row[col["previous_sender_id"]])
+
+        sender_arrivals = arrival_q.get((fid, sndr), {})
+        if pid in sender_arrivals:
+            q_out = sender_arrivals[pid]          # same quarter it arrived
+        else:
+            q_out = _quarter(row[col["previous_tx_timestamp_s"]])
+        outbound_q[(fid, sndr)][q_out].add(pid)
 
     # ── 1b. Build planned forwarding fractions from flow_rules list ──────
     # flow_rules dicts use flow_id with +1 offset (same as verified CSV)
