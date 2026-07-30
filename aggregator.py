@@ -43,6 +43,7 @@ LOG_FILE       = "/tmp/vanet_aggregator.log"
 AGGREGATED_DIR = "/tmp/ai_agent"          # ALL output files go here
 DRL_DIR        = "/tmp/drl_agent"         # mirror copy for DRL agent
 MIN_HOP_DIR    = "/tmp"                    # where NS-3 writes min_hops_next_hop_N.csv
+SPOOF_DIR      = "/tmp"                    # where NS-3 writes spoof_N.csv (ALS deviation)
 
 # ─────────────────────────────────────────────
 #  Constants  (mirrored from fix.cc)
@@ -328,6 +329,42 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
     return output_path
 
 
+
+# ============================================================
+#  LOAD SPOOF DEVIATION DATA  (from NS-3 spoof_N.csv)
+#  Builds a lookup:  node_id -> spoof_dev (float)
+#  spoof_N.csv is per-node (one row per node), so the same value
+#  is attached to every flow-row for that node downstream.
+# ============================================================
+def load_spoof_dev(cycle_id: int):
+    path = os.path.join(SPOOF_DIR, f"spoof_{cycle_id}.csv")
+
+    spoof = {}   # node_id -> spoof_dev
+
+    if not os.path.exists(path):
+        logger.warning(
+            f"[SPOOF] Cycle {cycle_id} | file not found: {path} "
+            f"(spoof_dev will be blank)"
+        )
+        return spoof
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                node = int(row["node_id"])
+                spoof[node] = float(row["spoof_dev"])
+            except (KeyError, ValueError):
+                continue
+
+    logger.info(
+        f"[SPOOF] Cycle {cycle_id} | loaded spoof_dev for {len(spoof)} nodes"
+    )
+    return spoof
+
+
+def load_shortest_next_hops(cycle_id: int):
+
 # ============================================================
 #  LOAD SHORTEST-NEXT-HOP DATA  (from NS-3 min_hops_next_hop_N.csv)
 #  Builds a lookup:  (flow_id, node_id) -> set of shortest next-hop ids
@@ -501,7 +538,8 @@ def load_cycle(overhear_rows, overhear_header,
 #  `writers` is a dict of three csv.writer objects (headers already written).
 # ============================================================
 def compute_cycle(data: dict, writers: dict,
-                  shortest_next_hops: dict, indistinct_nodes: set) -> dict:
+                  shortest_next_hops: dict, indistinct_nodes: set,
+                  spoof_dev_map: dict) -> dict:
     cycle    = data["cycle_id"]
     sim_time = data["sim_time"]
     inbound  = data["inbound"]
@@ -652,6 +690,13 @@ def compute_cycle(data: dict, writers: dict,
                 mean_q = sum(pdr_quarters) / 4.0
                 pdr_var = sum((p - mean_q) ** 2 for p in pdr_quarters) / 4.0
 
+                # ── SPOOF DEVIATION (per-node, from spoof_N.csv) ──────────
+                # Looked up by node_id only; same value across this node's flows.
+                if node_id in spoof_dev_map:
+                    spoof_dev_val = f"{spoof_dev_map[node_id]:.6f}"
+                else:
+                    spoof_dev_val = ""     # no spoof info for this node → blank
+
                 flow_node_records.append({
                     "node_id":        node_id,
                     "ntype":          ntype,
@@ -664,6 +709,7 @@ def compute_cycle(data: dict, writers: dict,
                     "pi_subflow":     pi_subflow,
                     "is_stretched":   is_stretched,
                     "pdr_var":        pdr_var,
+                    "spoof_dev":      spoof_dev_val,
                 })
 
         # ── Pass 2: mean PDR across this flow's scored nodes ─────────────
@@ -699,6 +745,7 @@ def compute_cycle(data: dict, writers: dict,
                         f"{r['node_pdr']:.2f}", f"{mean_pdr_flow:.2f}",
                         f"{pdr_deviation:.2f}", f"{inbound_ratio:.4f}",
                         r["is_stretched"], f"{r['pdr_var']:.4f}",
+                        r["spoof_dev"],
                     ])
 
     return {
@@ -761,6 +808,7 @@ def run_ff_analysis(cycle_id: int,
             "threshold", "detected", "total_inbound",
             "total_outbound", "node_pdr", "mean_pdr_flow",
             "pdr_deviation", "inbound_ratio", "is_stretched", "pdr_var",
+            "spoof_dev",
         ])
 
         writers = {"pool": pool_w, "ff": ff_w, "score": score_w}
@@ -775,8 +823,12 @@ def run_ff_analysis(cycle_id: int,
         # ── Stage 1b : load shortest next hops from NS-3 min-hop file ──
         shortest_next_hops, indistinct_nodes = load_shortest_next_hops(cycle_id)
 
+        # ── Stage 1c : load per-node spoof deviation from NS-3 spoof file ──
+        spoof_dev_map = load_spoof_dev(cycle_id)
+
         # ── Stage 2 : run FF / deviation / PDR / anomaly math ─────────
-        stats = compute_cycle(data, writers, shortest_next_hops, indistinct_nodes)
+        stats = compute_cycle(data, writers, shortest_next_hops,
+                              indistinct_nodes, spoof_dev_map)
 
     # ── Mirror the three FF CSVs to DRL_DIR ──────────────────────────────
     import shutil
