@@ -44,7 +44,6 @@ AGGREGATED_DIR = "/tmp/ai_agent"          # ALL output files go here
 DRL_DIR        = "/tmp/drl_agent"         # mirror copy for DRL agent
 MIN_HOP_DIR    = "/tmp"                    # where NS-3 writes min_hops_next_hop_N.csv
 SPOOF_DIR      = "/tmp"                    # where NS-3 writes spoof_N.csv (ALS deviation)
-NODE_FIRST_SEEN_CSV = os.path.join(AGGREGATED_DIR, "node_first_seen_cycle.csv")
 
 # ─────────────────────────────────────────────
 #  Constants  (mirrored from fix.cc)
@@ -98,11 +97,6 @@ def verify_cycle(cycle_id: int) -> dict:
     Recompute SHA-256 of combined payload → compare with stored_hash
 
     Returns a result dict (or None if no Fabric record found).
-
-    NOTE: Blockchain hash verification is currently DISABLED.
-          The function still fetches CIDs from Fabric and retrieves
-          data from IPFS, but the integrity check is bypassed.
-          Re-enable by uncommenting the verification block below.
     """
     logger.info(f"Verifying cycle {cycle_id}...")
 
@@ -131,24 +125,13 @@ def verify_cycle(cycle_id: int) -> dict:
         "planned_inbound": inbound_data.get("planned_inbound", []),
     }
 
-    # ── BLOCKCHAIN HASH VERIFICATION (disabled) ──────────────────────────
-    # Uncomment this block to re-enable tamper detection via SHA-256 check.
-    #
-    # canonical = json.dumps(
-    #     combined, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    # )
-    # computed_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    # verified = computed_hash == stored_hash
-    # logger.info(f"Cycle {cycle_id}: {'INTACT ✓' if verified else 'TAMPERED ✗'}")
-    # ── END BLOCKCHAIN HASH VERIFICATION ─────────────────────────────────
-
-    # Bypass: treat data as verified unconditionally
-    computed_hash = stored_hash   # placeholder — not actually computed
-    verified      = True          # bypassed
-    logger.info(
-        f"Cycle {cycle_id}: hash check BYPASSED — "
-        f"using IPFS data directly (re-enable verification when ready)"
+    canonical = json.dumps(
+        combined, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
+    computed_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    verified = computed_hash == stored_hash
+    logger.info(f"Cycle {cycle_id}: {'INTACT ✓' if verified else 'TAMPERED ✗'}")
 
     return {
         "cycle_id":           cycle_id,
@@ -345,56 +328,6 @@ def save_verified_planned_inbound_csv(cycle_id: int, planned_inbound: list) -> s
 
     return output_path
 
-
-# ============================================================
-#  NODE FIRST-SEEN TRACKER
-#  Records, for each node, the first cycle_id in which it was
-#  included in an aggregated result. Appends new nodes only —
-#  nodes already in the file are never overwritten.
-# ============================================================
-def update_node_first_seen_csv(cycle_id: int, present_nodes: list):
-    """
-    Reads NODE_FIRST_SEEN_CSV to find already-recorded nodes.
-    For every node in present_nodes not yet in the file,
-    appends a row:  node_id, cycle_id
-    Creates the file (with header) if it does not exist.
-    """
-    os.makedirs(AGGREGATED_DIR, exist_ok=True)
-
-    # Step 1: Load already-recorded node_ids from the file (if it exists)
-    already_seen = set()
-    if os.path.exists(NODE_FIRST_SEEN_CSV):
-        with open(NODE_FIRST_SEEN_CSV, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    already_seen.add(int(row["node_id"]))
-                except (KeyError, ValueError):
-                    continue
-
-    # Step 2: Find nodes in this cycle that have not been seen before
-    new_nodes = [n for n in present_nodes if n not in already_seen]
-
-    if not new_nodes:
-        logger.info(
-            f"[FIRST-SEEN] Cycle {cycle_id} | "
-            f"No new nodes — all {len(present_nodes)} already recorded"
-        )
-        return
-
-    # Step 3: Write header if file is brand-new, then append new rows
-    file_exists = os.path.exists(NODE_FIRST_SEEN_CSV)
-    with open(NODE_FIRST_SEEN_CSV, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["node_id", "cycle_id"])   # header on first creation
-        for node_id in sorted(new_nodes):
-            writer.writerow([node_id, cycle_id])
-
-    logger.info(
-        f"[FIRST-SEEN] Cycle {cycle_id} | "
-        f"Recorded {len(new_nodes)} new nodes → {NODE_FIRST_SEEN_CSV}"
-    )
 
 
 # ============================================================
@@ -990,11 +923,7 @@ def process_cycle(cycle_id: int):
             f"All {TOTAL_NODES} node files ready ✓"
         )
 
-    # ── Step 2: Fetch flow rules from Fabric/IPFS ─────────────────────────
-    # NOTE: Blockchain hash verification is DISABLED. verify_cycle() still
-    #       queries Fabric for CIDs and fetches data from IPFS, but the
-    #       SHA-256 integrity check is bypassed (always returns verified=True).
-    #       To re-enable: uncomment the verification block inside verify_cycle().
+    # ── Step 2: Verify blockchain-stored flow rules ───────────────────────
     result = verify_cycle(cycle_id)
 
     if result is None:
@@ -1004,20 +933,16 @@ def process_cycle(cycle_id: int):
         )
         return
 
-    # ── BLOCKCHAIN INTEGRITY GUARD (disabled) ────────────────────────────
-    # Uncomment to re-enable: stops processing if hash check fails.
-    #
-    # if not result["verified"]:
-    #     logger.warning(
-    #         f"[AGGREGATOR] Cycle {cycle_id} | "
-    #         f"Blockchain verification FAILED ✗ — possible tampering"
-    #     )
-    #     return
-    # ── END BLOCKCHAIN INTEGRITY GUARD ───────────────────────────────────
+    if not result["verified"]:
+        logger.warning(
+            f"[AGGREGATOR] Cycle {cycle_id} | "
+            f"Blockchain verification FAILED ✗ — possible tampering"
+        )
+        return
 
     logger.info(
         f"[AGGREGATOR] Cycle {cycle_id} | "
-        f"IPFS data fetched (hash check bypassed) | "
+        f"Blockchain verification PASSED ✓ | "
         f"flow_rules={len(result['flow_rules'])}"
     )
 
@@ -1028,9 +953,6 @@ def process_cycle(cycle_id: int):
     aggregated_path, overhear_header, overhear_rows = aggregate_node_csvs(
         cycle_id, present
     )
-
-    # ── Step 4b: Record first-seen cycle for each node ────────────────────
-    update_node_first_seen_csv(cycle_id, present)
 
     # ── Step 5: Save verified planned inbound CSV ─────────────────────────
     save_verified_planned_inbound_csv(cycle_id, result["planned_inbound"])
